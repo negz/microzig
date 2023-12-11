@@ -191,27 +191,18 @@ pub fn Usb(comptime f: anytype) type {
                                     // in practice, the host always asks for either
                                     // (1) the exact size of a config descriptor, or
                                     // (2) 64 bytes, and this all fits in 64 bytes.
-                                    const id = usb_config.?.interface_descriptor.serialize();
-                                    @memcpy(S.tmp[used .. used + id.len], &id);
-                                    used += id.len;
 
-                                    // Seems like the host does not bother asking for the
-                                    // hid descriptor so we'll just send it with the
-                                    // other descriptors.
-                                    if (usb_config.?.hid) |hid_conf| {
-                                        const hd = hid_conf.hid_descriptor.serialize();
-                                        @memcpy(S.tmp[used .. used + hd.len], &hd);
-                                        used += hd.len;
-                                    }
+                                    // TODO(negz): Depending on the number of descriptors
+                                    // this might not fit in 64 bytes. Split message
+                                    // into multiple packets?
 
-                                    // TODO: depending on the number of endpoints
-                                    // this might not fit in 64 bytes -> split message
-                                    // into multiple packets
-                                    for (usb_config.?.endpoints[2..]) |ep| {
-                                        const ed = ep.descriptor.serialize();
-                                        @memcpy(S.tmp[used .. used + ed.len], &ed);
-                                        used += ed.len;
-                                    }
+                                    // TODO(negz): Re-add HID support once CDC works. :)
+
+                                    // TODO(negz): Why do we need a ? here? Neither
+                                    // usb_config or config_descriptors are optional.
+                                    const a = usb_config.?.config_descriptor_appendix;
+                                    @memcpy(S.tmp[used .. used + a.len], &a);
+                                    used += a.len;
                                 }
 
                                 // Set up EP0 IN to send the stuff we just composed.
@@ -261,6 +252,10 @@ pub fn Usb(comptime f: anytype) type {
                                 // Note that the C example gets away with ignoring
                                 // this.
                             },
+                            .InterfaceAssociation => {
+                                if (debug) std.log.info("        InterfaceAssociation", .{});
+                                // Same deal as interface descriptors above.
+                            },
                             .Endpoint => {
                                 if (debug) std.log.info("        Endpoint", .{});
                                 // Same deal as interface descriptors above.
@@ -286,45 +281,6 @@ pub fn Usb(comptime f: anytype) type {
                                     S.tmp[0..data.len],
                                 );
                             },
-                        }
-                    } else {
-                        // Maybe the unknown request type is a hid request
-
-                        if (usb_config.?.hid) |hid_conf| {
-                            const _hid_desc_type = hid.DescType.from_u16(setup.value >> 8);
-
-                            if (_hid_desc_type) |hid_desc_type| {
-                                switch (hid_desc_type) {
-                                    .Hid => {
-                                        if (debug) std.log.info("        HID", .{});
-
-                                        const hd = hid_conf.hid_descriptor.serialize();
-                                        @memcpy(S.tmp[0..hd.len], &hd);
-
-                                        f.usb_start_tx(
-                                            usb_config.?.endpoints[EP0_IN_IDX],
-                                            S.tmp[0..hd.len],
-                                        );
-                                    },
-                                    .Report => {
-                                        if (debug) std.log.info("        Report", .{});
-
-                                        // The report descriptor is already a (static)
-                                        // u8 array, i.e., we can pass it directly
-                                        f.usb_start_tx(
-                                            usb_config.?.endpoints[EP0_IN_IDX],
-                                            hid_conf.report_descriptor,
-                                        );
-                                    },
-                                    .Physical => {
-                                        if (debug) std.log.info("        Physical", .{});
-                                        // Ignore for now
-                                    },
-                                }
-                            } else {
-                                // It's not a valid HID request. This can totally happen
-                                // we'll just ignore it for now...
-                            }
                         }
                     }
                 } else if (reqty == Dir.In) {
@@ -447,6 +403,7 @@ pub const DescType = enum(u8) {
     Interface = 0x04,
     Endpoint = 0x05,
     DeviceQualifier = 0x06,
+    InterfaceAssociation = 0x0b,
     //-------- Class Specific Descriptors ----------
     // 0x21 ...
 
@@ -458,6 +415,7 @@ pub const DescType = enum(u8) {
             4 => @This().Interface,
             5 => @This().Endpoint,
             6 => @This().DeviceQualifier,
+            11 => @This().InterfaceAssociation,
             else => null,
         };
     }
@@ -623,6 +581,42 @@ pub const ConfigurationDescriptor = extern struct {
     }
 };
 
+// Description of an interface association.
+// See https://www.usb.org/sites/default/files/iadclasscode_r10.pdf
+pub const InterfaceAssociationDescriptor = extern struct {
+    // Length of this structure, must be 8.
+    length: u8,
+    // Type of this descriptor, must be `InterfaceAssociation`.
+    descriptor_type: DescType,
+    // First interface number of the set of interfaces that follow this
+    // descriptor.
+    first_interface: u8,
+    // The number of interfaces that follow this descriptor that are considered
+    // associated.
+    interface_count: u8,
+    // The interface class used for associated interfaces.
+    function_class: u8,
+    // The interface subclass used for associated interfaces.
+    function_subclass: u8,
+    // The interface protocol used for associated interfaces.
+    function_protocol: u8,
+    // Index of the string descriptor describing the associated interfaces.
+    function: u8,
+
+    pub fn serialize(self: *const @This()) [8]u8 {
+        var out: [8]u8 = undefined;
+        out[0] = 8; // length
+        out[1] = @intFromEnum(self.descriptor_type);
+        out[2] = self.first_interface;
+        out[3] = self.interface_count;
+        out[4] = self.function_class;
+        out[5] = self.function_subclass;
+        out[6] = self.function_protocol;
+        out[7] = self.function;
+        return out;
+    }
+};
+
 /// Describes a device. This is the most broad description in USB and is
 /// typically the first thing the host asks for.
 pub const DeviceDescriptor = extern struct {
@@ -743,7 +737,6 @@ pub const SetupPacket = extern struct {
 // +++++++++++++++++++++++++++++++++++++++++++++++++
 
 pub const EndpointConfiguration = struct {
-    descriptor: *const EndpointDescriptor,
     /// Index of this endpoint's control register in the `ep_control` array.
     ///
     /// TODO: this can be derived from the endpoint address, perhaps it should
@@ -771,15 +764,18 @@ pub const EndpointConfiguration = struct {
 
 pub const DeviceConfiguration = struct {
     device_descriptor: *const DeviceDescriptor,
-    interface_descriptor: *const InterfaceDescriptor,
     config_descriptor: *const ConfigurationDescriptor,
+
+    // Descriptors to "append" to the config descriptor.
+    config_descriptor_appendix: []const u8,
+
     lang_descriptor: []const u8,
     descriptor_strings: []const []const u8,
-    hid: ?struct {
-        hid_descriptor: *const hid.HidDescriptor,
-        report_descriptor: []const u8,
-    } = null,
-    endpoints: [4]*EndpointConfiguration,
+
+    // Endpoint descriptors appear in config_descriptors. Endpoint
+    // configurations are indexed by their order within config descriptors. For
+    // example the first endpoint descriptor corresponds to configuration zero.
+    endpoints: []*EndpointConfiguration,
 };
 
 /// Buffer pointers, once they're prepared and initialized.
@@ -788,7 +784,7 @@ pub const Buffers = struct {
     ep0_buffer0: [*]u8,
     /// Fixed EP0 Buffer1, defined by the hardware and NOT USED in this driver
     ep0_buffer1: [*]u8,
-    /// /// Remaining buffer pool
+    /// Remaining buffer pool
     rest: [16][*]u8,
 
     /// Gets a buffer corresponding to a `data_buffer_index` in a
